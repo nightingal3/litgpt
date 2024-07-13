@@ -62,12 +62,12 @@ class MixedDataset(DataModule):
 
     # A path to a directory containing both pretraining data (files in txt form) as well as SFT data (json files). Should contain two subdirectories "texts" and "sft".
     pretraining_data_path: str = "data/"
-    sft_data_paths: List[str] = ["sft/"]
-    sft_dataset_names: List[str] = ["sft1"]
-    data_ratios: List[str] = [
+    sft_data_paths: Tuple[str] = "sft/"
+    sft_dataset_names: Tuple[str] = "sft1"
+    data_ratios: Tuple[str] = (
         0.5,
         0.5,
-    ]  # the data ratios of [pretrain_dist, sft1, ...., sft_n]. Must add up to 1.
+    )  # the data ratios of [pretrain_dist, sft1, ...., sft_n]. Must add up to 1.
     pretrain_data_type: str = "streaming"  # "streaming" or "txt"
     sft_val_split_fraction: float = 0.05
     max_seq_length: int = field(init=False, repr=False, default=2048)
@@ -96,12 +96,25 @@ class MixedDataset(DataModule):
 
         self.sft_train_datasets = {name: None for name in self.sft_dataset_names}
         self.sft_val_datasets = {name: None for name in self.sft_dataset_names}
-        assert len(self.sft_data_paths) == len(self.sft_data_names), "the length of the data paths provided must be equal to the length of sft set names"
-        assert len(self.data_ratios) == len(self.sft_data_paths) + 1, "data_ratios must be the same length as num sft data paths + 1"
+        assert len(self.sft_data_paths) == len(
+            self.sft_data_names
+        ), "the length of the data paths provided must be equal to the length of sft set names"
+        assert (
+            len(self.data_ratios) == len(self.sft_data_paths) + 1
+        ), "data_ratios must be the same length as num sft data paths + 1"
         assert sum(self.data_ratios) == 1, "data_ratios must sum to 1"
+        assert not any(
+            self.data_ratios[i] < 0 for i in range(len(self.sft_dataset_names))
+        ), "all data ratios must be positive"
+        assert not any(
+            self.sft_dataset_names[i] == "lm"
+            for i in range(len(self.sft_dataset_names))
+        ), "lm is a reserved name for pretraining data"
 
     def setup(self):
-        for sft_data_name, sft_data_path in zip(self.sft_data_names, self.sft_data_paths):
+        for sft_data_name, sft_data_path in zip(
+            self.sft_data_names, self.sft_data_paths
+        ):
             sft_train_data, sft_val_data = get_splits(
                 Path(self.sft_data_path),
                 self.sft_val_split_fraction,
@@ -299,7 +312,8 @@ class MixedDataset(DataModule):
                 shuffle=True,
                 num_workers=self.num_workers,
                 collate_fn=get_sft_collate_fn(
-                    max_seq_length=self.max_seq_length_sft, ignore_index=self.ignore_index
+                    max_seq_length=self.max_seq_length_sft,
+                    ignore_index=self.ignore_index,
                 ),
             )
             sft_val_dataloaders[sft_name] = sft_val_dataloader
