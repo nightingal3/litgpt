@@ -7,11 +7,13 @@ from functools import partial
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, List, Optional, Tuple, Union
+from tqdm import tqdm
+import re
 
 import torch
 from lightning.fabric.utilities.load import _NotYetLoadedTensor as NotYetLoadedTensor
 
-from litgpt import Config
+from litgpt.config import Config
 from litgpt.utils import (
     extend_checkpoint_dir,
     lazy_load,
@@ -272,24 +274,125 @@ def copy_weights_phi(
             del qkv_weights[i][weight_type]
 
 
-def layer_template(layer_name: str, idx: int) -> Tuple[str, int]:
-    split = layer_name.split(".")
-    number = int(split[idx])
-    split[idx] = "{}"
-    from_name = ".".join(split)
-    return from_name, number
+def qkv_reassemble(
+    param: Union[torch.Tensor, NotYetLoadedTensor], config: Config
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reassemble from a normal to an interleaved placement in a QKV matrix.
+    [Q, K, V, Q, K, V, ...] --> [Q, Q, ..., K, K, ..., V, V, ...]
+    """
+    q_per_kv = config.n_head // config.n_query_groups
+    qs = []
+    ks = []
+    vs = []
+    for chunk in torch.chunk(param, config.n_query_groups):
+        split = torch.split(chunk, [config.head_size * q_per_kv, config.head_size, config.head_size])
+        qs.append(split[0])
+        ks.append(split[1])
+        vs.append(split[2])
+    q = torch.cat(qs)
+    k = torch.cat(ks)
+    v = torch.cat(vs)
+    return torch.cat((q, k, v))
+
+def layer_template(layer_name: str, num_matches: int = 1) -> Tuple[str, int]:
+    pattern = r"\.(\d+)\."
+    if not (search_res := re.findall(pattern, layer_name)):
+        return layer_name, -1
+    layer_name_template = re.sub(pattern, ".{}.", layer_name, count=num_matches)
+    return layer_name_template, *(int(x) for x in search_res[:num_matches])
 
 
-def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype: Optional[torch.dtype]) -> torch.Tensor:
+
+def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype: Optional[torch.dtype], verbose: bool = False) -> torch.Tensor:
     if hasattr(param, "_load_tensor"):
         # support tensors loaded via `lazy_load()`
-        print(f"Loading {name!r} into RAM")
+        if verbose:
+            print(f"Loading {name!r} into RAM")
         param = param._load_tensor()
     if dtype is not None and type(dtype) is not NotYetLoadedTensor and dtype != param.dtype:
-        print(f"Converting {name!r} from {param.dtype} to {dtype}")
+        if verbose:
+            print(f"Converting {name!r} from {param.dtype} to {dtype}")
         param = param.to(dtype)
     return param
 
+
+def copy_weights_olmo2(
+    config: Config,
+    qkv_weights: Dict[int, List[Optional[NotYetLoadedTensor]]],
+    state_dict: Dict[str, torch.Tensor],
+    hf_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
+    saver: Optional[incremental_save] = None,
+    dtype: Optional[torch.dtype] = None,
+    pbar: Optional[tqdm] = None,
+    progress_per_file: Optional[float] = None,
+    debug_mode: Optional[bool] = False,
+) -> None:
+    weight_map = {
+        "model.embed_tokens.weight": "transformer.wte.weight",
+        "model.layers.{}.self_attn.q_norm.weight": "transformer.h.{}.attn.q_norm.weight",
+        "model.layers.{}.self_attn.q_proj.weight": None,
+        "model.layers.{}.self_attn.k_norm.weight": "transformer.h.{}.attn.k_norm.weight",
+        "model.layers.{}.self_attn.k_proj.weight": None,
+        "model.layers.{}.self_attn.v_proj.weight": None,
+        "model.layers.{}.self_attn.o_proj.weight": "transformer.h.{}.attn.proj.weight",
+        "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
+        "model.layers.{}.post_attention_layernorm.weight": "transformer.h.{}.post_attention_norm.weight",
+        "model.layers.{}.post_attention_layernorm.bias": "transformer.h.{}.post_attention_norm.bias",
+        "model.layers.{}.post_feedforward_layernorm.weight": "transformer.h.{}.post_mlp_norm.weight",
+        "model.norm.weight": "transformer.ln_f.weight",
+        "model.norm.bias": "transformer.ln_f.bias",
+        "lm_head.weight": "lm_head.weight",
+    }
+    if config.mlp_class_name in ("LLaMAMLP", "GemmaMLP"):
+        weight_map.update(
+            {
+                "model.layers.{}.mlp.gate_proj.weight": "transformer.h.{}.mlp.fc_1.weight",
+                "model.layers.{}.mlp.up_proj.weight": "transformer.h.{}.mlp.fc_2.weight",
+                "model.layers.{}.mlp.down_proj.weight": "transformer.h.{}.mlp.proj.weight",
+            }
+        )
+    else:
+        raise NotImplementedError
+
+    if progress_per_file is not None:
+        progress_per_file = progress_per_file / max(1, len(hf_weights) + len(qkv_weights))
+
+    for from_name, param in hf_weights.items():
+        name_template, *ids = layer_template(from_name, num_matches=2)
+        to_name = weight_map[name_template]
+        param = load_param(param, from_name, dtype, verbose=debug_mode)
+        if any(w in from_name for w in ("q_proj", "k_proj", "v_proj")):
+            qkv = qkv_weights.setdefault(ids[0], defaultdict(dict))
+            weight_name, weight_type = from_name.split(".")[-2:]
+            qkv[weight_type][weight_name] = param
+        if to_name is None:
+            continue
+        to_name = to_name.format(*ids)
+        if saver is not None:
+            param = saver.store_early(param)
+        state_dict[to_name] = param
+
+        if progress_per_file is not None:
+            pbar.update(progress_per_file)
+
+    if "lm_head.weight" not in state_dict:
+        state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
+
+    for i in list(qkv_weights):
+        for weight_type in list(qkv_weights[i]):
+            qkv = qkv_weights[i][weight_type]
+            if len(qkv) != 3:
+                # qkv is splitted across different .bin files
+                continue
+            q = load_param(qkv["q_proj"], f"layer {i} q {weight_type}", dtype, verbose=debug_mode)
+            k = load_param(qkv["k_proj"], f"layer {i} k {weight_type}", dtype, verbose=debug_mode)
+            v = load_param(qkv["v_proj"], f"layer {i} v {weight_type}", dtype, verbose=debug_mode)
+            qkv = torch.cat((q, k, v))
+            state_dict[f"transformer.h.{i}.attn.qkv.{weight_type}"] = qkv
+            del qkv_weights[i][weight_type]
+
+            if progress_per_file is not None:
+                pbar.update(progress_per_file)
 
 @torch.inference_mode()
 def convert_hf_checkpoint(
@@ -329,6 +432,10 @@ def convert_hf_checkpoint(
         # holder to reconstitute the split q, k, v
         qkv_weights = {}
         copy_fn = partial(copy_weights_phi, config, qkv_weights)
+    elif "olmo2" in model_name:
+        # holder to reconstitute the split q, k, v
+        qkv_weights = {}
+        copy_fn = partial(copy_weights_olmo2, config, qkv_weights)
     else:
         copy_fn = copy_weights_gpt_neox
 

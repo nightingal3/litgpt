@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Optional, Union
+import logging
+
 
 from litdata.streaming import (
     CombinedStreamingDataset,
@@ -20,20 +22,32 @@ from litgpt.data import DataModule
 from torch.utils.data import DataLoader
 
 
-def tokenize(data, index):
-    yield self.tokenizer.encode(data[index]["text"], eos=True)
+def tokenize(data, index, tokenizer):
+    yield tokenizer.encode(data[index]["text"], eos=True)
 
 
-def safe_tokenize(data, index):
+def _safe_tokenize(data, index, tokenizer):
     """Tokenize text and skip invalid cases."""
     try:
         text = data[index].get("text", "")
         if text and isinstance(text, str):
-            tokens = self.tokenizer.encode(text.strip(), eos=True)
+            tokens = tokenizer.encode(text.strip(), eos=True)
             if tokens:
                 yield tokens
     except Exception as e:
         logging.warning(f"Error processing index {index}: {str(e)}")
+
+def process_and_tokenize(dataset, tokenizer, idx):
+    """Process a dataset item and tokenize it."""
+    try:
+        example = dataset[idx]
+        text = example.get("text", "")
+        if text and isinstance(text, str):
+            tokens = tokenizer.encode(text.strip(), eos=True)
+            if tokens is not None:
+                yield tokens
+    except Exception as e:
+        logging.warning(f"Error processing index {idx}: {str(e)}")
 
 
 @dataclass
@@ -52,7 +66,7 @@ class FineWebDataset(DataModule):
     """The seed to use for shuffling the training data."""
     num_workers: int = 8
     """The number of workers to use for the dataloaders."""
-    data_split: str = "sample-100BT"
+    data_split: str = "sample-10BT"
     fast_dev_run: bool = False
 
     tokenizer: Optional[Tokenizer] = field(default=None, repr=False, init=False)
@@ -70,7 +84,7 @@ class FineWebDataset(DataModule):
 
     def _has_sharded_structure(self, base_dir: Union[str, Path]) -> bool:
         """Check if the directory has numbered subdirectories (0-7) with index.json files."""
-        for i in range(10):
+        for i in range(4):
             shard_dir = os.path.join(base_dir, str(i))
             if os.path.isdir(shard_dir) and os.path.exists(
                 os.path.join(shard_dir, "index.json")
@@ -96,7 +110,7 @@ class FineWebDataset(DataModule):
         """Create a combined dataset from sharded directories."""
         datasets = []
 
-        for i in range(10):
+        for i in range(4):
             shard_dir = os.path.join(base_dir, str(i))
             if os.path.isdir(shard_dir) and os.path.exists(
                 os.path.join(shard_dir, "index.json")
@@ -152,14 +166,25 @@ class FineWebDataset(DataModule):
         # print("Saving dataset to disk")
         # dataset.save_to_disk(self.data_path)
 
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer is not set. Please call connect() first.")
         # Split the data in training and validation
         split_dataset = dataset.train_test_split(
             test_size=self.val_split_fraction, seed=self.seed, shuffle=True
         )
         split_dataset["val"] = split_dataset.pop("test")  # rename the test split to val
+
+        # TODO: remove after -- limit size for testing
+        split_dataset["train"] = split_dataset["train"].select(range(10000))
+        split_dataset["val"] = split_dataset["val"].select(range(1000))
+
+        #process_train = partial(process_and_tokenize, dataset=split_dataset["train"], tokenizer=self.tokenizer)
+        #process_val = partial(process_and_tokenize, dataset=split_dataset["val"], tokenizer=self.tokenizer)
+
         breakpoint()
+
         optimize(
-            fn=partial(safe_tokenize, split_dataset["train"], self.tokenizer),
+            fn=partial(process_and_tokenize, split_dataset["train"], self.tokenizer),
             inputs=list(range(len(split_dataset["train"]))),
             output_dir=self.data_path_train,
             num_workers=8,
@@ -168,7 +193,7 @@ class FineWebDataset(DataModule):
         )
 
         optimize(
-            fn=partial(safe_tokenize, split_dataset["val"], self.tokenizer),
+            fn=partial(process_and_tokenize, split_dataset["val"], self.tokenizer),
             inputs=list(range(len(split_dataset["val"]))),
             output_dir=self.data_path_val,
             num_workers=8,
@@ -230,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--fast_dev_run", action="store_true")
 
     args = parser.parse_args()
+
     fw = FineWebDataset(
         data_path=args.data_path,
         data_split=args.data_split,

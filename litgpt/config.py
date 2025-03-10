@@ -30,6 +30,14 @@ class Config:
     parallel_residual: bool = True
     bias: bool = True
     lm_head_bias: bool = False
+    norm_1: bool = True
+    norm_2: bool = True
+    norm_qk: bool = False
+    post_mlp_norm: bool = False
+    post_attention_norm: bool = False
+    attn_bias: bool = False
+    sliding_window_size: Optional[int] = None
+    rope_adjustments: Optional[dict] = None
     # to use multi-head attention (MHA), set this to `n_head` (default)
     # to use multi-query attention (MQA), set this to 1
     # to use grouped-query attention (GQA), set this to a value in between
@@ -52,13 +60,16 @@ class Config:
     # credit https://arxiv.org/pdf/2305.13245.pdf
     n_query_groups: Optional[int] = None
     shared_attention_norm: bool = False
+    attention_scores_scalar: Optional[int] = None
     norm_class_name: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
     norm_eps: float = 1e-5
     mlp_class_name: Literal["GptNeoxMLP", "LLaMAMLP", "GemmaMLP", "LLaMAMoE"] = "GptNeoxMLP"
     gelu_approximate: str = "none"
     intermediate_size: Optional[int] = None
+    attention_logit_softcapping: Optional[float] = None
     rope_condense_ratio: int = 1
     rope_base: int = 10000
+    final_logit_softcapping: Optional[float] = None
     n_expert: int = 0
     n_expert_per_token: int = 0
 
@@ -136,14 +147,17 @@ class Config:
     @property
     def norm_class(self) -> Type:
         # `self.norm_class_name` cannot be the type to keep the config serializable
-        if self.norm_class_name == "RMSNorm":
-            from functools import partial
+        from functools import partial
 
+        if self.norm_class_name == "RMSNorm":
             from litgpt.model import RMSNorm
 
             return partial(RMSNorm, add_unit_offset="Gemma" in self.name)
-        return getattr(torch.nn, self.norm_class_name)
+        if self.norm_class_name == "LayerNorm" and "OLMo" in self.name:
+            # TODO - should this be changed for olmo2?
+            return partial(torch.nn.LayerNorm, elementwise_affine=True)
 
+        return getattr(torch.nn, self.norm_class_name)
 
 ########################
 # Stability AI StableLM
@@ -1615,5 +1629,140 @@ llama_2_function_calling = [
 ]
 
 configs.extend(llama_2_function_calling)
+
+#################
+# Allen AI OLMo
+#################
+# NOTE: credit to this PR. I'm not sure if all the changes are compatible with my ver of litgpt so not merging it in directly
+# https://github.com/Lightning-AI/litgpt/pull/1827/files#diff-02b899038912e0f5189f2a365a3126d3fb0e5b304fd09111bf572208a204c12f
+olmo = [
+    # https://huggingface.co/allenai/OLMo-1B-hf/blob/main/config.json
+    dict(
+        name="OLMo-1B-hf",
+        hf_config=dict(org="allenai", name="OLMo-1B-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_embd=2048,
+        n_layer=16,
+        n_head=16,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=8192,
+    ),
+    # https://huggingface.co/allenai/OLMo-7B-hf/blob/main/config.json
+    dict(
+        name="OLMo-7B-hf",
+        hf_config=dict(org="allenai", name="OLMo-7B-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+    ),
+    # https://huggingface.co/allenai/OLMo-7B-Instruct-hf/blob/main/config.json
+    dict(
+        name="OLMo-7B-Instruct-hf",
+        hf_config=dict(org="allenai", name="OLMo-7B-Instruct-hf"),
+        vocab_size=50280,
+        padded_vocab_size=50304,
+        block_size=2048,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="LayerNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+    ),
+]
+
+configs.extend(olmo)
+
+#################
+# Allen AI OLMo2
+#################
+
+olmo2 = [    
+    # https://huggingface.co/allenai/OLMo-2-1124-7B/blob/main/config.json
+    dict(
+        name="OLMo2-7B-hf-stage2",
+        hf_config=dict(org="allenai", name="OLMo-2-1124-7B"),
+        vocab_size=100278,
+        padded_vocab_size=100352,
+        block_size=4096,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0, # TODO - confirm this
+        parallel_residual=False, # TODO - confirm this
+        bias=False,
+        norm_class_name="RMSNorm", # TODO - confirm that this changed to rmsnorm
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+        rope_base=500000,
+        norm_qk=True,
+        post_mlp_norm=True,
+        norm_1=False,
+        norm_2=False,
+        post_attention_norm=True
+    ),
+    # same as prev but early chkpt
+    dict(
+        name="OLMo2-7B-hf-stage1",
+        hf_config=dict(org="allenai", name="OLMo-2-1124-7B", revision="stage1-step928646-tokens3896B"),
+        vocab_size=100352,
+        padded_vocab_size=100352, # TODO - idk what this is, will check
+        block_size=4096,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0, # TODO - confirm this
+        parallel_residual=False, # TODO - confirm this
+        bias=False,
+        norm_class_name="RMSNorm", # TODO - confirm that this changed to rmsnorm
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+        rope_base=500000,
+        norm_qk=True,
+        post_mlp_norm=True,
+        norm_1=False,
+        norm_2=False,
+        post_attention_norm=True
+    ),
+    # https://huggingface.co/allenai/OLMo-2-1124-7B-Instruct/blob/main/config.json
+    dict(
+        name="OLMo2-7B-hf-instruct",
+        hf_config=dict(org="allenai", name="OLMo-2-1124-7B-Instruct"),
+        vocab_size=100352,
+        padded_vocab_size=100352, # TODO - idk what this is, will check
+        block_size=4096,
+        n_layer=32,
+        n_head=32,
+        rotary_percentage=1.0, # TODO - confirm this
+        parallel_residual=False, # TODO - confirm this
+        bias=False,
+        norm_class_name="RMSNorm", # TODO - confirm that this changed to rmsnorm
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+        rope_base=500000,
+        norm_qk=True,
+        post_mlp_norm=True,
+        norm_1=False,
+        norm_2=False,
+        post_attention_norm=True
+    ),
+]
+
+configs.extend(olmo2)
+
 
 name_to_config = {config["name"]: config for config in configs}
