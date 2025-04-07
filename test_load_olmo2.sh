@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --partition=general          
+#SBATCH --partition=preempt          
 #SBATCH --job-name=sanity_check_myenv
-#SBATCH --gres=gpu:6000Ada:8                
+#SBATCH --gres=gpu:A100_80GB:8                
 #SBATCH --output=sanitycheck_%J.out
 #SBATCH --time=3:00:00
 #SBATCH --mem=200G
@@ -35,6 +35,8 @@ set +a
 source ${MINICONDA_PATH}
 conda activate llm_env_dev_copy
 
+export NCCL_P2P_DISABLE=1
+
 srun python -m litgpt pretrain OLMo2-7B-hf-stage2 \
   --data FineWebDataset \
   --data.num_workers 1 \
@@ -48,4 +50,5 @@ srun python -m litgpt pretrain OLMo2-7B-hf-stage2 \
   --eval.interval 10 \
   --out_dir ./testing \
   --seed 1337 \
+  --precision "bf16-true" \
   --train.max_additional_steps 10
