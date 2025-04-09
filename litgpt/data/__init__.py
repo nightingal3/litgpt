@@ -21,6 +21,7 @@ from litgpt.data.microllama import MicroLlama  # isort: skip
 from litgpt.data.mixed_dataset_inprog import MixedDataset  # isort: skip
 from litgpt.data.mixed_dataset import MixedDatasetClassic  # isort: skip
 from litgpt.data.fineweb import FineWebDataset  # isort: skip
+from litgpt.data.olmo2_data import Olmo2Dataset, DolminoDataset  # isort: skip
 
 __all__ = [
     "Alpaca",
@@ -42,5 +43,7 @@ __all__ = [
     "MixedDataset",
     "MixedDatasetClassic",
     "FineWebDataset",
+    "Olmo2Dataset",
+    "DolminoDataset",
     "get_sft_collate_fn",
 ]
