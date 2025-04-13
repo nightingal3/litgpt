@@ -89,8 +89,11 @@ class RotatingTensorBoardLogger(TensorBoardLogger):
         super().log_metrics(metrics, step)
         self._write_count += len(metrics)
 
-def init_out_dir(out_dir: Path) -> Path:
-    if not out_dir.is_absolute() and "LIGHTNING_ARTIFACTS_DIR" in os.environ:
+def init_out_dir(out_dir: Union[str, Path]) -> Union[str, Path]:
+    if str(out_dir).startswith("gs://"):
+        # keep this as a str since it's not a posixpath
+        return str(out_dir)
+    if not Path(out_dir).is_absolute() and "LIGHTNING_ARTIFACTS_DIR" in os.environ:
         return Path(os.getenv("LIGHTNING_ARTIFACTS_DIR")) / out_dir
     return out_dir
 
@@ -663,7 +666,7 @@ def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
 
         optimizer["init_args"].update(kwargs)
         # NOTE: this seems to have been causing an issue where the lr is not passed
-        if isinstance(optimizer["lr"], str):
+        if isinstance(optimizer.get("lr"), str):
             optimizer["lr"] = float(optimizer["lr"])
         if optimizer["init_args"].get("lr") and isinstance(
             optimizer["init_args"]["lr"], str
