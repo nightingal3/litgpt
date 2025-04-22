@@ -20,6 +20,7 @@ from litgpt.prompts import save_prompt_style
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     check_valid_checkpoint_dir,
+    capture_hparams,
     choose_logger,
     chunked_cross_entropy,
     copy_config_files,
@@ -59,6 +60,10 @@ def setup(
     logger_name: Literal["wandb", "tensorboard", "csv"] = "csv",
     seed: int = 1337,
     const_lr: bool = False,
+    wandb_entity: Optional[str] = None,
+    wandb_group: Optional[str] = None,
+    wandb_tags: Optional[List[str]] = None,
+    no_save_chkpt: bool = False,
 ) -> None:
     """Finetune a model.
 
@@ -87,13 +92,28 @@ def setup(
     config = Config.from_file(checkpoint_dir / "model_config.yaml")
 
     precision = precision or get_default_supported_precision(training=True)
-    logger = choose_logger(
-        logger_name,
-        out_dir,
-        name=f"finetune-{config.name}",
-        resume=resume,
-        log_interval=train.log_interval,
-    )
+
+    if logger_name == "wandb":
+        hparams = capture_hparams()
+        logger = choose_logger(
+            logger_name,
+            out_dir,
+            name=f"finetune-{config.name}",
+            resume=resume,
+            log_interval=train.log_interval,
+            entity=wandb_entity,
+            group=wandb_group,
+            tags=wandb_tags,
+            config=hparams
+        )
+    else:
+        logger = choose_logger(
+            logger_name,
+            out_dir,
+            name=f"finetune-{config.name}",
+            resume=resume,
+            log_interval=train.log_interval,
+        )
 
     if devices > 1:
         # NOTE: this causes an error on TC, trying the version from pretrain?
@@ -123,6 +143,7 @@ def setup(
         eval,
         optimizer,
         const_lr=const_lr,
+        no_save_chkpt=no_save_chkpt,
     )
 
 
@@ -139,6 +160,7 @@ def main(
     eval: EvalArgs,
     optimizer: Union[str, Dict],
     const_lr: bool = False,
+    no_save_chkpt: bool = False,
 ) -> None:
     validate_args(train, eval)
 
@@ -213,6 +235,7 @@ def main(
         train,
         eval,
         data,
+        no_save_chkpt=no_save_chkpt,
     )
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
@@ -233,14 +256,15 @@ def main(
         )
 
     # Save the final checkpoint at the end of training
-    save_path = out_dir / "final" / "lit_model.pth"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fabric.save(save_path, {"model": state["model"]})
-    if fabric.global_rank == 0:
-        # Copy checkpoint files from original checkpoint dir
-        copy_config_files(checkpoint_dir, save_path.parent)
-        save_hyperparameters(setup, save_path.parent)
-        save_prompt_style(data.prompt_style, save_path.parent)
+    if not no_save_chkpt:
+        save_path = out_dir / "final" / "lit_model.pth"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fabric.save(save_path, {"model": state["model"]})
+        if fabric.global_rank == 0:
+            # Copy checkpoint files from original checkpoint dir
+            copy_config_files(checkpoint_dir, save_path.parent)
+            save_hyperparameters(setup, save_path.parent)
+            save_prompt_style(data.prompt_style, save_path.parent)
 
 
 def fit(
@@ -255,6 +279,7 @@ def fit(
     train: TrainArgs,
     eval: EvalArgs,
     data: DataModule,
+    no_save_chkpt: bool = False,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -376,6 +401,7 @@ def fit(
             train.save_interval is not None
             and not is_accumulating
             and state["step_count"] % train.save_interval == 0
+            and not no_save_chkpt
         ):
             checkpoint_file = (
                 out_dir / f"step-{state['step_count']:06d}" / "lit_model.pth"

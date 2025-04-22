@@ -7,6 +7,7 @@ from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
+import fsspec
 
 import lightning as L
 import torch
@@ -50,8 +51,8 @@ from typing_extensions import Literal
 def setup(
     model_name: str,
     model_config: Optional[Config] = None,
-    out_dir: Path = Path("out/pretrain"),
-    logs_dir: Path = Path("out/pretrain"),
+    out_dir: Union[str, Path] = Path("out/pretrain"),
+    logs_dir: Union[str, Path] = Path("out/pretrain"),
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
     initial_checkpoint_dir: Optional[Path] = None,
     resume: Union[bool, Path] = False,
@@ -76,6 +77,10 @@ def setup(
     tokenizer_dir: Optional[Path] = None,
     logger_name: Literal["wandb", "tensorboard", "csv"] = "tensorboard",
     seed: int = 42,
+    wandb_id: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_group: Optional[str] = None,
+    wandb_tags: Optional[str] = None,
 ):
     """Pretrain a model.
 
@@ -132,15 +137,30 @@ def setup(
     logs_dir = init_out_dir(logs_dir)
     # in case the dataset requires the Tokenizer
     tokenizer = Tokenizer(tokenizer_dir) if tokenizer_dir is not None else None
+    
+    if logger_name == "wandb":
+        logger = choose_logger(
+            logger_name,
+            logs_dir,
+            name=f"pretrain-{config.name}",
+            resume=resume,
+            log_interval=train.log_interval,
+            id=wandb_id,
+            entity=wandb_entity,
+            group=wandb_group,
+            tags=wandb_tags,
+            config=hparams,
+        )
+    else:
+        logger = choose_logger(
+            logger_name,
+            logs_dir,
+            name=f"pretrain-{config.name}",
+            resume=resume,
+            log_interval=train.log_interval,
+        )
 
-    logger = choose_logger(
-        logger_name,
-        logs_dir,
-        name=f"pretrain-{config.name}",
-        resume=resume,
-        log_interval=train.log_interval,
-    )
-
+    print(f"NUM DEVICES: {devices}")
     if devices > 1:
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
@@ -150,7 +170,7 @@ def setup(
     else:
         strategy = "auto"
     fabric = L.Fabric(
-        devices=devices, strategy=strategy, precision=precision, loggers=[logger]
+        accelerator="gpu", devices=devices, num_nodes=1, strategy=strategy, precision=precision, loggers=[logger]
     )
     fabric.launch()
 
@@ -185,7 +205,7 @@ def main(
     resume: Union[bool, Path],
     config: Config,
     data: DataModule,
-    out_dir: Path,
+    out_dir: Union[Path, str],
     tokenizer_dir: Optional[Path],
     tokenizer: Optional[Tokenizer],
     train: TrainArgs,
@@ -197,7 +217,8 @@ def main(
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
     if fabric.global_rank == 0:
-        out_dir.mkdir(parents=True, exist_ok=True)
+        if not str(out_dir).startswith("gs://"):
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     fabric.seed_everything(seed)  # same seed for every process to init model (FSDP)
 
@@ -215,7 +236,7 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    # model = torch.compile(model)
+    model = torch.compile(model)
     model = fabric.setup(model)
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
@@ -263,7 +284,7 @@ def main(
 
     if resume is True:
         resume = max(
-            out_dir.rglob("step-*/*.pth"),
+            Path(out_dir).rglob("step-*/*.pth"),
             key=(lambda p: int(p.parent.name.split("-")[1])),
         )
     if resume:
@@ -289,7 +310,8 @@ def main(
     )
 
     # Save final checkpoint
-    save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
+
+    save_checkpoint(fabric, state, tokenizer_dir, Path(out_dir) / "final" / "lit_model.pth")
 
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
@@ -312,11 +334,13 @@ def fit(
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
+    fabric.print("Reached the fit function ...")
 
     if eval.initial_validation:
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
         val_loss = f"{val_loss:.3f}"
     else:
+        fabric.print("Initial validation...")
         validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
         val_loss = "n/a"
 
@@ -340,7 +364,7 @@ def fit(
 
     initial_iter = state["iter_num"]
 
-    if max_iters and max_additional_steps:
+    if max_additional_steps:
         fabric.print(
             "Specified both max iters and max additional steps, overriding max_iters with max_additional_steps"
         )
@@ -356,14 +380,19 @@ def fit(
         window=train.gradient_accumulation_iters(devices), sync_on_compute=False
     ).to(fabric.device)
     fabric.barrier()
+    print(f"Rank {fabric.global_rank}: passed synchronization at beginning of train")
     total_t0 = time.perf_counter()
 
     warmup_iters = train.warmup_iters(devices, max_iters, train_dataloader)
     initial_lr = optimizer.param_groups[0]["lr"]
 
+    fabric.print(f"Initial LR: {initial_lr}")
+    fabric.print("Reached the training loop ...")
+
     for train_data in train_iterator:
+        #fabric.print("Reached the training loop ...")
         if state["iter_num"] >= max_iters:
-            fabric.print("Reached max iters, exiting")
+            #fabric.print("Reached max iters, exiting")
             break
 
         # determine and set the learning rate for this iteration
@@ -390,16 +419,20 @@ def fit(
             # it looks like we want the final LR to
         elif train.lr_scheduler == "cosine":
             lr = get_lr(
-                0.0004,  # the default lr is too high. using this one
+                0.0003,  # the default lr is too high. using this one
                 state["iter_num"],
                 warmup_iters,
                 max_iters,
                 train.min_lr,
             )
         elif train.lr_scheduler == "constant":
-            lr = initial_lr
+            #lr = initial_lr
+            # TODO: testing this
+            lr = 1e-5
         else:
             raise NotImplementedError
+
+        #fabric.print("Got the learning rate ...")
 
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
@@ -413,10 +446,15 @@ def fit(
         is_accumulating = (
             state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
         )
+        #fabric.print(f"iter: {state['iter_num']}, is_accumulating: {is_accumulating}, train gradient accumulation: {train.gradient_accumulation_iters(devices)}")
+
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
+            #fabric.print("completed forward")
             loss = chunked_cross_entropy(logits, targets)
+            #fabric.print("completed loss")
             fabric.backward(loss / train.gradient_accumulation_iters(devices))
+            #fabric.print("completed backward")
 
         running_loss.update(loss.detach())
 
@@ -486,25 +524,35 @@ def fit(
             val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
             val_loss = val_loss.item()
             td = time.perf_counter() - t0
-
+            
             fabric.print(
                 f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms"
             )
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             fabric.barrier()
+            print(f"Rank {fabric.global_rank}: Passed synchronization barrier in validation")
 
         if (
             train.save_interval is not None
             and not is_accumulating
             and state["step_count"] % train.save_interval == 0
         ):
-            save_checkpoint(
-                fabric,
-                state,
-                tokenizer_dir,
-                out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth",
-            )
+            if isinstance(out_dir, str) and out_dir.startswith("gs://"):
+                save_checkpoint_gcs(
+                    fabric,
+                    state,
+                    tokenizer_dir,
+                    f"{out_dir}/step-{state['step_count']:08d}/lit_model.pth",
+                )
+            else:
+                out_dir = Path(out_dir)
+                save_checkpoint(
+                    fabric,
+                    state,
+                    tokenizer_dir,
+                    out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth",
+                )
 
     # Final validation
     if eval.final_validation:
@@ -588,6 +636,7 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
 
 def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file):
     model = state["model"]
+    checkpoint_file = Path(checkpoint_file)
     checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
     fabric.print(f"Saving checkpoint to {str(checkpoint_file)!r}")
     fabric.save(checkpoint_file, state)
@@ -597,6 +646,18 @@ def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file):
             copy_config_files(tokenizer_dir, checkpoint_file.parent)
         save_config(model.config, checkpoint_file.parent)
 
+def save_checkpoint_gcs(fabric, state, tokenizer_dir, checkpoint_file):
+    assert checkpoint_file.startswith("gs://"), "Checkpoint file must start with gs:// for save_checkpoint_gcs"
+    fs = fsspec.filesystem("gcs")
+    
+    fabric.print(f"Saving checkpoint to {str(checkpoint_file)!r}")
+    with fs.open(checkpoint_file, "wb") as f:
+        fabric.save(f, state)
+    if fabric.global_rank == 0:
+        save_hyperparameters(setup, checkpoint_file.parent)
+        if tokenizer_dir is not None:
+            copy_config_files(tokenizer_dir, checkpoint_file.parent)
+        save_config(model.config, checkpoint_file.parent)
 
 def validate_args(
     train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resume
