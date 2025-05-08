@@ -51,6 +51,7 @@ def setup(
         global_batch_size=64,
         micro_batch_size=8,
         lr_warmup_steps=100,
+        lr_warmup_fraction=None,
         epochs=5,
         max_seq_length=None,
         max_lr=1e-4,
@@ -199,8 +200,14 @@ def main(
             optimizer, factor=1, total_iters=lr_max_steps
         )
     else:
+        # prioritize fraction > steps
+        if train.lr_warmup_fraction is not None:
+            warmup_steps = int(train.lr_warmup_fraction * lr_max_steps)
+        else:
+            warmup_steps = train.lr_warmup_steps
+
         scheduler = get_lr_scheduler(
-            optimizer, warmup_steps=train.lr_warmup_steps, max_steps=lr_max_steps
+            optimizer, warmup_steps=warmup_steps, max_steps=lr_max_steps
         )
 
     state = {
@@ -551,7 +558,7 @@ def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
 def validate_args(train: TrainArgs, eval: EvalArgs) -> None:
     issues = []
     unsupported = [
-        (train, ["max_tokens", "max_norm", "tie_embeddings", "lr_warmup_fraction"])
+        (train, ["max_tokens", "max_norm", "tie_embeddings"])
     ]
     for args, names in unsupported:
         for name in names:
