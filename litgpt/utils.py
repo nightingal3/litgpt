@@ -509,10 +509,14 @@ class CycleIterator:
         return self
 
 
-def copy_config_files(source_dir: Path, out_dir: Path) -> None:
+def copy_config_files(source_dir: Path, out_dir: Path, no_copy_config: bool = False) -> None:
     """Copies the specified configuration and tokenizer files into the output directory."""
 
-    config_files = ["config.json", "generation_config.json", "model_config.yaml"]
+    # skip config.json since it's sometimes wrong, we generate our own in save_config
+    config_files = ["generation_config.json", "model_config.yaml", "config.json"]
+    if no_copy_config:
+        config_files.remove("model_config.yaml")
+
     tokenizer_files = ["tokenizer.json", "tokenizer.model", "tokenizer_config.json"]
 
     for file_name in config_files + tokenizer_files:
@@ -581,6 +585,12 @@ def save_config(config: "Config", checkpoint_dir: Path) -> None:
         config_dict = asdict(config)
         with open(checkpoint_dir / "model_config.yaml", "w", encoding="utf-8") as fp:
             yaml.dump(config_dict, fp)
+
+        if config.name.startswith("pythia-"):
+            # Fetch and write the HF-style config.json for Pythia
+            hf_name = f"EleutherAI/{config.name}"
+            hf_config = GPTNeoXConfig.from_pretrained(hf_name)
+            hf_config.save_pretrained(output_dir)
     except:
         # TODO: look into why this fails
         print(

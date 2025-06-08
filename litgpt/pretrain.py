@@ -120,6 +120,14 @@ def setup(
     if model_config is None:
         # Support both model_name options: meta-llama/Meta-Llama-3-8B & Meta-Llama-3-8B
         try:
+            # NOTE: more expected behaviour since this surprised me/caused training bugs -- default to config from HF if user passes in a model existing on hf rather than taking the litgpt config which may be mismatched. Limit to pythia for now, add others before release
+
+            # if model_name and model_name.startswith("pythia"):
+            #     from transformers import GPTNeoXConfig
+            #     hf_name = f"EleutherAI/{model_name}"
+            #     model_config = GPTNeoXConfig.from_pretrained(hf_name, local_files_only=True)
+            #     model_config.name = model_name
+            # else:
             model_config = Config.from_name(model_name)
         except ValueError:
             print(f"Model name {model_name} is not supported.\n")
@@ -143,9 +151,8 @@ def setup(
             logger_name,
             logs_dir,
             name=f"pretrain-{config.name}",
-            resume=resume,
+            resume=False,
             log_interval=train.log_interval,
-            id=wandb_id,
             entity=wandb_entity,
             group=wandb_group,
             tags=wandb_tags,
@@ -160,7 +167,6 @@ def setup(
             log_interval=train.log_interval,
         )
 
-    print(f"NUM DEVICES: {devices}")
     if devices > 1:
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
@@ -230,8 +236,8 @@ def main(
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
-    if train.max_seq_length:
-        model.max_seq_length = train.max_seq_length
+
+    model.max_seq_length = train.max_seq_length if train.max_seq_length is not None else config.block_size
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
@@ -418,11 +424,13 @@ def fit(
             # note: the hyperparam may have to be scaled according to the gradient accumulation iters?
             # it looks like we want the final LR to
         elif train.lr_scheduler == "cosine":
+            sched_max_iters = 976560
+            #TODO testing this fix change this back later
             lr = get_lr(
                 0.0003,  # the default lr is too high. using this one
                 state["iter_num"],
                 warmup_iters,
-                max_iters,
+                sched_max_iters,
                 train.min_lr,
             )
         elif train.lr_scheduler == "constant":
@@ -643,7 +651,8 @@ def save_checkpoint(fabric, state, tokenizer_dir, checkpoint_file):
     if fabric.global_rank == 0:
         save_hyperparameters(setup, checkpoint_file.parent)
         if tokenizer_dir is not None:
-            copy_config_files(tokenizer_dir, checkpoint_file.parent)
+            is_pythia_chkpt = "pythia" in str(tokenizer_dir)
+            copy_config_files(tokenizer_dir, checkpoint_file.parent, no_copy_config=is_pythia_chkpt)
         save_config(model.config, checkpoint_file.parent)
 
 def save_checkpoint_gcs(fabric, state, tokenizer_dir, checkpoint_file):
