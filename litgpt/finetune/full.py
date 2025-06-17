@@ -425,24 +425,43 @@ def fit(
 # FSDP has issues with `inference_mode`
 @torch.no_grad()
 def validate(
-    fabric: L.Fabric, model: GPT, val_dataloader: DataLoader, eval: EvalArgs
-) -> torch.Tensor:
+    fabric: L.Fabric, model: GPT, val_dataloader: Union[Dict[DataLoader], DataLoader], eval: EvalArgs
+) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
     fabric.print("Validating ...")
     model.eval()
-    losses = torch.zeros(min(len(val_dataloader), eval.max_iters))
-    for k, batch in enumerate(val_dataloader):
-        if k >= eval.max_iters:
-            break
-        input_ids, targets = batch["input_ids"], batch["labels"]
-        logits = model(input_ids)
-        losses[k] = chunked_cross_entropy(
-            logits[..., :-1, :], targets[..., 1:], chunk_size=0
-        )
+    if isinstance(val_dataloader, DataLoader):
+        losses = torch.zeros(min(len(val_dataloader), eval.max_iters))
+        for k, batch in enumerate(val_dataloader):
+            if k >= eval.max_iters:
+                break
+            input_ids, targets = batch["input_ids"], batch["labels"]
+            logits = model(input_ids)
+            losses[k] = chunked_cross_entropy(
+                logits[..., :-1, :], targets[..., 1:], chunk_size=0
+            )
 
-    val_loss = losses.mean()
-    model.train()
-    return val_loss
+        val_loss = losses.mean()
+        model.train()
+        return val_loss
+    else:
+        # if multiple dataloaders, average the losses
+        losses = {}
+        for name, val_loader in val_dataloader.items():
+            fabric.print(f"Validating {name} ...")
+            model.eval()
+            losses[name] = torch.zeros(min(len(val_loader), eval.max_iters))
+            for k, batch in enumerate(val_loader):
+                if k >= eval.max_iters:
+                    break
+                input_ids, targets = batch["input_ids"], batch["labels"]
+                logits = model(input_ids)
+                losses[name][k] = chunked_cross_entropy(
+                    logits[..., :-1, :], targets[..., 1:], chunk_size=0
+                )
+            losses[name] = losses[name].mean()
 
+        model.train()
+        return losses
 
 @torch.no_grad()
 def generate_example(
