@@ -404,7 +404,7 @@ def fit(
         # determine and set the learning rate for this iteration
         if train.lr_scheduler == "wsd":
             lr = get_wsd_lr(
-                initial_lr,
+                0.0003,
                 state["iter_num"],
                 warmup_iters,
                 stable_iters,
