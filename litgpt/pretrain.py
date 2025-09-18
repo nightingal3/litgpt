@@ -81,6 +81,7 @@ def setup(
     wandb_entity: Optional[str] = None,
     wandb_group: Optional[str] = None,
     wandb_tags: Optional[str] = None,
+    enable_sample_generation: bool = False,
 ):
     """Pretrain a model.
 
@@ -200,6 +201,7 @@ def setup(
         optimizer,
         train.max_iters,
         train.max_additional_steps,
+        enable_sample_generation,
     )
 
 
@@ -219,6 +221,7 @@ def main(
     optimizer: Union[str, Dict],
     max_iters: Optional[int],
     max_additional_steps: Optional[int],
+    enable_sample_generation: bool = False,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
 
@@ -308,11 +311,13 @@ def main(
         val_dataloader,
         out_dir,
         tokenizer_dir,
+        tokenizer,
         train,
         eval,
         max_iters,
         max_additional_steps,
         stable_iters,
+        enable_sample_generation,
     )
 
     # Save final checkpoint
@@ -332,11 +337,13 @@ def fit(
     val_dataloader: DataLoader,
     out_dir: Path,
     tokenizer_dir: Optional[Path],
+    tokenizer: Optional[Tokenizer],
     train: TrainArgs,
     eval: EvalArgs,
     max_iters: int,
     max_additional_steps: Optional[int],
     stable_iters: Optional[int] = None,
+    enable_sample_generation: bool = False,
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
@@ -404,7 +411,7 @@ def fit(
         # determine and set the learning rate for this iteration
         if train.lr_scheduler == "wsd":
             lr = get_wsd_lr(
-                0.0003,
+                train.max_lr,
                 state["iter_num"],
                 warmup_iters,
                 stable_iters,
@@ -427,7 +434,7 @@ def fit(
             sched_max_iters = 976560
             #TODO testing this fix change this back later
             lr = get_lr(
-                0.0003,  # the default lr is too high. using this one
+                train.max_lr,  # Use configurable max_lr instead of hardcoded value
                 state["iter_num"],
                 warmup_iters,
                 sched_max_iters,
@@ -533,6 +540,10 @@ def fit(
             val_loss = val_loss.item()
             td = time.perf_counter() - t0
             
+            # Generate sample text for sanity check (gated by enable_sample_generation)
+            if enable_sample_generation and tokenizer is not None and fabric.global_rank == 0:
+                generate_sample_text(fabric, model, tokenizer)
+            
             fabric.print(
                 f"iter {state['iter_num']}: val loss {val_loss:.4f}, val time: {td * 1000:.2f} ms"
             )
@@ -594,6 +605,50 @@ def validate(
     model.train()
     fabric.barrier()
     return val_loss
+
+
+@torch.no_grad()
+def generate_sample_text(fabric: L.Fabric, model: nn.Module, tokenizer, prompt: str = "What is the capital of France? Answer: The capital of France is", max_new_tokens: int = 20):
+    """Generate sample text during validation for sanity checking."""
+    if fabric.global_rank != 0:  # Only generate on rank 0
+        return
+    
+    model.eval()
+    
+    # Tokenize the prompt
+    prompt_tokens = tokenizer.encode(prompt, eos=False)
+    prompt_length = len(prompt_tokens)
+    
+    # Convert to tensor and move to device
+    input_ids = torch.tensor(prompt_tokens, dtype=torch.long, device=fabric.device).unsqueeze(0)
+    
+    # Generate tokens
+    generated_tokens = input_ids.clone()
+    
+    for _ in range(max_new_tokens):
+        # Get model output
+        with torch.no_grad():
+            logits = model(generated_tokens)
+            next_token_logits = logits[0, -1, :]  # Get last token logits
+            
+            # Sample next token (using greedy decoding for consistency)
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # Append to generated sequence
+            generated_tokens = torch.cat([generated_tokens, next_token.unsqueeze(0)], dim=1)
+            
+            # Stop if we hit EOS or exceed model's max length
+            if next_token.item() == tokenizer.eos_id or generated_tokens.shape[1] >= model.max_seq_length:
+                break
+    
+    # Decode the generated text
+    generated_text = tokenizer.decode(generated_tokens[0].tolist())
+    
+    fabric.print(f"=== Sample Generation ===")
+    fabric.print(f"Generated: {generated_text}")
+    fabric.print(f"=========================")
+    
+    model.train()
 
 
 def get_dataloaders(
