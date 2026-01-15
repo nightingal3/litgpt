@@ -21,6 +21,8 @@ from litgpt.data.microllama import MicroLlama  # isort: skip
 from litgpt.data.mixed_dataset_inprog import MixedDataset  # isort: skip
 from litgpt.data.mixed_dataset import MixedDatasetClassic  # isort: skip
 from litgpt.data.fineweb import FineWebDataset  # isort: skip
+from litgpt.data.sharded_mixed_dataset import ShardedMixedDataset  # isort: skip
+from litgpt.data.multi_json_data import MultiJSON  # isort: skip
 
 __all__ = [
     "Alpaca",
@@ -30,6 +32,7 @@ __all__ = [
     "Dolly",
     "FLAN",
     "JSON",
+    "MultiJSON",
     "LitData",
     "DataModule",
     "LongForm",
@@ -42,5 +45,7 @@ __all__ = [
     "MixedDataset",
     "MixedDatasetClassic",
     "FineWebDataset",
+    "ShardedMixedDataset",
+    "DolminoDataset",
     "get_sft_collate_fn",
 ]
