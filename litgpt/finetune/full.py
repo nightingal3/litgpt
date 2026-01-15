@@ -248,19 +248,38 @@ def main(
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
-    # Final evaluation
     if eval.final_validation:
-        val_loss = validate(
-            fabric,
-            model,
-            val_dataloader,
-            dataclasses.replace(eval, max_iters=len(val_dataloader)),
-        )
-        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-        fabric.log_dict(metrics, step=state["iter_num"])
-        fabric.print(
-            f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}"
-        )
+        if isinstance(val_dataloader, dict):
+            # Full validation for each loader in the dict
+            full_eval = dataclasses.replace(eval, max_iters=None)
+
+            # Optional: log per-loader sizes for sanity
+            if fabric.global_rank == 0:
+                sizes = {name: len(dl) for name, dl in val_dataloader.items()}
+                fabric.print(f"Final evaluation will run full val for loaders: {sizes}")
+
+        else:
+            # Full validation for a single loader
+            full_eval = dataclasses.replace(eval, max_iters=len(val_dataloader))
+            if fabric.global_rank == 0:
+                fabric.print(f"Final evaluation will run full val for loader: {len(val_dataloader)} batches")
+
+        val_loss = validate(fabric, model, val_dataloader, full_eval)
+
+        if isinstance(val_loss, dict):
+            metrics = {}
+            for k, v in val_loss.items():
+                fabric.print(f"Final evaluation | {k}: {v:.3f}")
+                metrics[f"{k}_loss"] = v
+                metrics[f"{k}_ppl"] = math.exp(v)
+            fabric.log_dict(metrics, step=state["iter_num"])
+        else:
+            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            fabric.log_dict(metrics, step=state["iter_num"])
+            fabric.print(
+                f"Final evaluation | val loss: {val_loss:.3f} | val ppl: {math.exp(val_loss):.3f}"
+            )
+
 
     # Save the final checkpoint at the end of training
     if not no_save_chkpt:
@@ -292,8 +311,15 @@ def fit(
     optimizer = state["optimizer"]
     scheduler = state["scheduler"]
     tokenizer = Tokenizer(checkpoint_dir)
+
+    if isinstance(val_dataloader, dict):
+        val_dls = list(val_dataloader.values())
+        datasets = [train_dataloader.dataset] + [dl.dataset for dl in val_dls]
+    else:
+        datasets = [train_dataloader.dataset, val_dataloader.dataset]
+
     longest_seq_length, longest_seq_ix = get_longest_seq_length(
-        ConcatDataset([train_dataloader.dataset, val_dataloader.dataset])
+        ConcatDataset(datasets)
     )
     model.max_seq_length = min(longest_seq_length, train.max_seq_length or float("inf"))
     fabric.print(
@@ -398,10 +424,20 @@ def fit(
             val_loss = validate(fabric, model, val_dataloader, eval)
             # generate_example(fabric, model, tokenizer, eval, data)
             t1 = time.perf_counter() - t0
-            fabric.print(
-                f"iter {state['iter_num']}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms"
-            )
-            metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+            
+            if isinstance(val_loss, dict):
+                metrics = {}
+                for k, v in val_loss.items():
+                    metrics[f"{k}_loss"] = v
+                    metrics[f"{k}_ppl"] = math.exp(v)
+                    fabric.print(
+                        f"iter {state['iter_num']}: val loss {v:.4f} | val time: {t1 * 1000:.2f} ms"
+                    )
+            else:
+                metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+                fabric.print(
+                    f"iter {state['iter_num']}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms"
+                )
             fabric.log_dict(metrics, step=state["iter_num"])
             fabric.barrier()
         if (
@@ -423,43 +459,40 @@ def fit(
 
 
 # FSDP has issues with `inference_mode`
+
 @torch.no_grad()
-def validate(
-    fabric: L.Fabric, model: GPT, val_dataloader: Union[Dict[DataLoader], DataLoader], eval: EvalArgs
-) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+def validate(fabric, model, val_dataloader, eval):
     fabric.print("Validating ...")
     model.eval()
-    if isinstance(val_dataloader, DataLoader):
-        losses = torch.zeros(min(len(val_dataloader), eval.max_iters))
+
+    def _cap(loader_len: int) -> int:
+        return loader_len if eval.max_iters is None else min(loader_len, eval.max_iters)
+
+    if not isinstance(val_dataloader, dict):
+        max_iters = _cap(len(val_dataloader))
+        losses = torch.zeros(max_iters, device=fabric.device)
         for k, batch in enumerate(val_dataloader):
-            if k >= eval.max_iters:
+            if k >= max_iters:
                 break
             input_ids, targets = batch["input_ids"], batch["labels"]
             logits = model(input_ids)
-            losses[k] = chunked_cross_entropy(
-                logits[..., :-1, :], targets[..., 1:], chunk_size=0
-            )
-
+            losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
         val_loss = losses.mean()
         model.train()
         return val_loss
     else:
-        # if multiple dataloaders, average the losses
         losses = {}
         for name, val_loader in val_dataloader.items():
             fabric.print(f"Validating {name} ...")
-            model.eval()
-            losses[name] = torch.zeros(min(len(val_loader), eval.max_iters))
+            max_iters = _cap(len(val_loader))
+            buf = torch.zeros(max_iters, device=fabric.device)
             for k, batch in enumerate(val_loader):
-                if k >= eval.max_iters:
+                if k >= max_iters:
                     break
                 input_ids, targets = batch["input_ids"], batch["labels"]
                 logits = model(input_ids)
-                losses[name][k] = chunked_cross_entropy(
-                    logits[..., :-1, :], targets[..., 1:], chunk_size=0
-                )
-            losses[name] = losses[name].mean()
-
+                buf[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
+            losses[name] = buf.mean()
         model.train()
         return losses
 
@@ -528,7 +561,6 @@ def _generate_example(
         )
         model.clear_kv_cache()
         model.train()
-        breakpoint()
         new_output_only = tokenizer.decode(output[input_ids.shape[0] :])
         output = tokenizer.decode(output)
         fabric.print("Generated answer: ", new_output_only)
@@ -560,9 +592,17 @@ def get_dataloaders(
     data.setup()
     train_dataloader = data.train_dataloader()
     val_dataloader = data.val_dataloader()
-    train_dataloader, val_dataloader = fabric.setup_dataloaders(
-        train_dataloader, val_dataloader
-    )
+
+    if not isinstance(val_dataloader, dict):
+        train_dataloader, val_dataloader = fabric.setup_dataloaders(
+            train_dataloader, val_dataloader
+        )
+    else:
+        # multiple validation datasets
+        train_dataloader = fabric.setup_dataloaders(train_dataloader)
+        val_dataloader = {
+            name: fabric.setup_dataloaders(dl) for name, dl in val_dataloader.items()
+        }
     return train_dataloader, val_dataloader
 
 
